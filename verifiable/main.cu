@@ -3,7 +3,7 @@
  *
  * See LICENSE.txt for license information
  ************************************************************************/
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 #include <iostream>
 
 #define NCCL_VERIFIABLE_SELF_TEST 1
@@ -11,8 +11,8 @@
 
 int main(int arg_n, char **args) {
   std::cerr<<"You are hoping to see no output beyond this line."<<std::endl;
-  cudaSetDevice(0);
+  hipSetDevice(0);
   ncclVerifiableLaunchSelfTest();
-  cudaDeviceSynchronize();
+  hipDeviceSynchronize();
   return 0;
 }

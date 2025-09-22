@@ -8,8 +8,8 @@
 //#pragma nv_diag_suppress declared_but_not_referenced
 
 #include "verifiable.h"
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 #include <hip/hip_bfloat16.h>
 
 #include "rccl/rccl.h"
@@ -982,9 +982,9 @@ __global__ void __launch_bounds__(512, 1) prepareInput2(
 }
 
 template<typename ReduceOp>
-cudaError_t prepareInput1(
+hipError_t prepareInput1(
     void *elts, intptr_t elt_n, int elt_ty, ReduceOp op, int rank_n, int rank_me,
-    uint64_t seed, intptr_t elt_ix0, cudaStream_t stream
+    uint64_t seed, intptr_t elt_ix0, hipStream_t stream
   ) {
   void const *fn = nullptr;
   switch(elt_ty) {
@@ -1009,21 +1009,21 @@ cudaError_t prepareInput1(
   #endif
   case ncclFloat32: fn = (void const*)&prepareInput2<float, ReduceOp>; break;
   case ncclFloat64: fn = (void const*)&prepareInput2<double, ReduceOp>; break;
-  default: assert(0); return cudaErrorInvalidValue;
+  default: assert(0); return hipErrorInvalidValue;
   }
   #undef CASE_TY
   dim3 grid = {1, 1, 1};
   grid.x = (unsigned int)std::min<intptr_t>(32, (elt_n + 4*512-1)/(4*512));
   dim3 block = {512, 1, 1};
   void *args[7] = {&elts, &elt_n, &op, &rank_n, &rank_me, &seed, &elt_ix0};
-  if (grid.x == 0) return cudaSuccess;
-  return cudaLaunchKernel(fn, grid, block, args, 0, stream);
+  if (grid.x == 0) return hipSuccess;
+  return hipLaunchKernel(fn, grid, block, args, 0, stream);
 }
 }
 
 hipError_t ncclVerifiablePrepareInput(
     void *elts, intptr_t elt_n, int elt_ty, int red_op, int rank_n, int rank_me,
-    uint64_t seed, intptr_t elt_ix0, cudaStream_t stream
+    uint64_t seed, intptr_t elt_ix0, hipStream_t stream
   ) {
   #define CASE_OP(op) \
     if(rank_n == 1) \
@@ -1070,9 +1070,9 @@ __global__ void __launch_bounds__(512, 1) prepareExpected2(
 }
 
 template<typename ReduceOp>
-cudaError_t prepareExpected1(
+hipError_t prepareExpected1(
     void *elts, intptr_t elt_n, int elt_ty, ReduceOp op, int rank_n,
-    uint64_t seed, intptr_t elt_ix0, cudaStream_t stream
+    uint64_t seed, intptr_t elt_ix0, hipStream_t stream
   ) {
   void const *fn = nullptr;
   switch(elt_ty) {
@@ -1097,21 +1097,21 @@ cudaError_t prepareExpected1(
   #endif
   case ncclFloat32: { fn = (void const*)&prepareExpected2<float, ReduceOp>; break; }
   case ncclFloat64: { fn = (void const*)&prepareExpected2<double, ReduceOp>; break; }
-  default: assert(0); return cudaErrorInvalidValue;
+  default: assert(0); return hipErrorInvalidValue;
   }
 
   dim3 grid = {1, 1, 1};
   grid.x = (unsigned int)std::min<intptr_t>(32, (elt_n + 4*512-1)/(4*512));
   dim3 block = {512, 1, 1};
   void *args[6] = {&elts, &elt_n, &op, &rank_n, &seed, &elt_ix0};
-  if (grid.x == 0) return cudaSuccess;
-  return cudaLaunchKernel(fn, grid, block, args, 0, stream);
+  if (grid.x == 0) return hipSuccess;
+  return hipLaunchKernel(fn, grid, block, args, 0, stream);
 }
 }
 
 hipError_t ncclVerifiablePrepareExpected(
     void *elts, intptr_t elt_n, int elt_ty, int red_op, int rank_n,
-    uint64_t seed, intptr_t elt_ix0, cudaStream_t stream
+    uint64_t seed, intptr_t elt_ix0, hipStream_t stream
   ) {
   #define CASE_OP(op) \
     if(rank_n == 1) \
@@ -1181,7 +1181,7 @@ __global__ void __launch_bounds__(512, 1) verifyPrepared(
 }
 
 hipError_t verifyPrepared1(int bytePerElt,
-  void const *results, void const *expected, intptr_t elt_n, unsigned tolerance, int64_t *bad_elt_n, cudaStream_t stream, int block_n
+  void const *results, void const *expected, intptr_t elt_n, unsigned tolerance, int64_t *bad_elt_n, hipStream_t stream, int block_n
 ) {
   void const *fn = nullptr;
   switch(bytePerElt) {
@@ -1189,13 +1189,13 @@ hipError_t verifyPrepared1(int bytePerElt,
   case 2: fn = (void const*)&verifyPrepared<uint16_t>; break;
   case 4: fn = (void const*)&verifyPrepared<uint32_t>; break;
   case 8: fn = (void const*)&verifyPrepared<uint64_t>; break;
-  default: assert(0); return cudaErrorInvalidValue;
+  default: assert(0); return hipErrorInvalidValue;
   }
   dim3 grid = {(unsigned int)block_n, 1, 1};
   dim3 block = {512, 1, 1};
   void *args[5] = {&results, &expected, &elt_n, &tolerance, &bad_elt_n};
-  if (grid.x == 0) return cudaSuccess;
-  return cudaLaunchKernel(fn, grid, block, args, 0, stream);
+  if (grid.x == 0) return hipSuccess;
+  return hipLaunchKernel(fn, grid, block, args, 0, stream);
 }
 
 template<typename T, typename Uint, typename ReduceFn>
@@ -1235,7 +1235,7 @@ __global__ void __launch_bounds__(512, 1) verifyInline2(
 template<typename T, typename Uint>
 hipError_t verifyInline1(
     T const *results, intptr_t elt_n, int red_op, int rank_n, uint64_t seed, intptr_t elt_ix0,
-    unsigned tolerance, int64_t *bad_elt_n, cudaStream_t stream, int block_n
+    unsigned tolerance, int64_t *bad_elt_n, hipStream_t stream, int block_n
   ) {
   void const *fn = nullptr;
   ReduceNil opnil;
@@ -1269,15 +1269,15 @@ hipError_t verifyInline1(
   #undef CASE_OP
   dim3 grid = {(unsigned int)block_n, 1, 1};
   dim3 block = {512, 1, 1};
-  if (grid.x == 0) return cudaSuccess;
-  return cudaLaunchKernel(fn, grid, block, args, 0, stream);
+  if (grid.x == 0) return hipSuccess;
+  return hipLaunchKernel(fn, grid, block, args, 0, stream);
 }
 }
 
 hipError_t ncclVerifiableVerify(
     void const *results, void const *expected, intptr_t elt_n, int elt_ty,
     int red_op, int rank_n, uint64_t seed, intptr_t elt_ix0,
-    int64_t *bad_elt_n, cudaStream_t stream
+    int64_t *bad_elt_n, hipStream_t stream
   ) {
   bool floating = elt_ty == ncclFloat16 || elt_ty == ncclFloat32 || elt_ty == ncclFloat64;
   #if HAVE_ncclBfloat16
@@ -1332,7 +1332,7 @@ hipError_t ncclVerifiableVerify(
   #endif
   case ncclFloat32: CASE_TY(float, uint32_t)
   case ncclFloat64: CASE_TY(double, uint64_t)
-  default: assert(0); return cudaErrorInvalidValue;
+  default: assert(0); return hipErrorInvalidValue;
   }
   #undef CASE_TY
 }

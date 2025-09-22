@@ -7,7 +7,7 @@
  * See LICENSE.txt for license information
  ************************************************************************/
 
-#include "cuda_runtime.h"
+#include <hip/hip_runtime.h>
 #include "rccl_float8.h"
 #include <hip/hip_bfloat16.h>
 #include "common.h"
@@ -16,7 +16,6 @@
 #include <string>
 #include <string.h>
 #include <ctype.h>
-#include "cuda.h"
 #include <vector>
 #include <utility>
 #include <chrono>
@@ -272,7 +271,7 @@ static int memorytype = 0;
 static uint32_t cumask[4];
 static int streamnull = 0;
 static int timeout = 0;
-static int cudaGraphLaunches = 0;
+static int graphLaunches = 0;
 std::string output_file;
 std::string output_format;
 static int report_cputime = 0;
@@ -289,7 +288,7 @@ static int enable_rotating_tensor = 0;
 #define SYMMETRIC_REGISTER 2
 static int local_register = 0;
 #endif
-static int minCudaArch = 1<<30;
+static int minHipArch = 1<<30;
 
 Reporter::Reporter(std::string fileName, std::string outputFormat) : _outputFormat(outputFormat) {
   if (!fileName.empty()) {
@@ -494,18 +493,18 @@ static bool minReqVersion(int rmajor, int rminor, int rpatch)
 }
 
 testResult_t CheckDelta(void* results, void* expected, size_t count, size_t offset, ncclDataType_t type, ncclRedOp_t op, uint64_t seed, int nranks, int64_t *wrongEltN) {
-  CUDACHECK(ncclVerifiableVerify(results, expected, count, (int)type, (int)op, nranks, seed, offset, wrongEltN, cudaStreamDefault));
-  CUDACHECK(cudaDeviceSynchronize());
+  HIPCHECK(ncclVerifiableVerify(results, expected, count, (int)type, (int)op, nranks, seed, offset, wrongEltN, hipStreamDefault));
+  HIPCHECK(hipDeviceSynchronize());
   return testSuccess;
 }
 
 testResult_t InitDataReduce(void* data, const size_t count, const size_t offset, ncclDataType_t type, ncclRedOp_t op, uint64_t seed, int nranks) {
-  CUDACHECK(ncclVerifiablePrepareExpected(data, count, (int)type, (int)op, nranks, seed, offset, cudaStreamDefault));
+  HIPCHECK(ncclVerifiablePrepareExpected(data, count, (int)type, (int)op, nranks, seed, offset, hipStreamDefault));
   return testSuccess;
 }
 
 testResult_t InitData(void* data, const size_t count, size_t offset, ncclDataType_t type, ncclRedOp_t op, uint64_t seed, int nranks, int rank) {
-  CUDACHECK(ncclVerifiablePrepareInput(data, count, (int)type, (int)op, nranks, rank, seed, offset, cudaStreamDefault));
+  HIPCHECK(ncclVerifiablePrepareInput(data, count, (int)type, (int)op, nranks, rank, seed, offset, hipStreamDefault));
   return testSuccess;
 }
 
@@ -610,11 +609,11 @@ testResult_t CheckData(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
   size_t count = args->expectedBytes/wordSize(type);
 
   int64_t *wrongPerGpu = nullptr;
-  CUDACHECK(hipHostMalloc((void**)&wrongPerGpu, args->nGpus*sizeof(int64_t), cudaHostAllocMapped));
+  HIPCHECK(hipHostMalloc((void**)&wrongPerGpu, args->nGpus*sizeof(int64_t), hipHostMallocMapped));
 
   for (int i=0; i<args->nGpus; i++) {
     int rank = ((args->proc*args->nThreads + args->thread)*args->nGpus + i);
-    CUDACHECK(cudaSetDevice(args->gpus[i]));
+    HIPCHECK(hipSetDevice(args->gpus[i]));
     void *data = in_place ? ((void *)((uintptr_t)args->recvbuffs[i] + args->recvInplaceOffset*rank)) : args->recvbuffs[i];
 
     TESTCHECK(CheckDelta(data, args->expected[i], count, 0, type, op, 0, nranks, wrongPerGpu+i));
@@ -625,8 +624,8 @@ testResult_t CheckData(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
       char *expectedHost = (char*)malloc(args->expectedBytes);
       char *dataHost = (char*)malloc(args->expectedBytes);
       int eltsz = wordSize(type);
-      cudaMemcpy(expectedHost, args->expected[i], args->expectedBytes, cudaMemcpyDeviceToHost);
-      cudaMemcpy(dataHost, data, args->expectedBytes, cudaMemcpyDeviceToHost);
+      hipMemcpy(expectedHost, args->expected[i], args->expectedBytes, hipMemcpyDeviceToHost);
+      hipMemcpy(dataHost, data, args->expectedBytes, hipMemcpyDeviceToHost);
 
       for(int j=0; j<args->expectedBytes/eltsz; j++) {
         unsigned long long want, got;
@@ -646,14 +645,14 @@ testResult_t CheckData(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
 
   *wrongElts = 0;
   for (int i=0; i < args->nGpus; i++) *wrongElts += wrongPerGpu[i];
-  cudaFreeHost(wrongPerGpu);
+  hipHostFree(wrongPerGpu);
 
   if (args->reportErrors && *wrongElts) args->errors[0]++;
   return testSuccess;
 }
 
-testResult_t testStreamSynchronize(int ngpus, cudaStream_t* streams, ncclComm_t* comms) {
-  cudaError_t cudaErr;
+testResult_t testStreamSynchronize(int ngpus, hipStream_t* streams, ncclComm_t* comms) {
+  hipError_t hipErr;
   int remaining = ngpus;
   int* done = (int*)malloc(sizeof(int)*ngpus);
   memset(done, 0, sizeof(int)*ngpus);
@@ -664,15 +663,15 @@ testResult_t testStreamSynchronize(int ngpus, cudaStream_t* streams, ncclComm_t*
    for (int i=0; i<ngpus; i++) {
      if (done[i]) continue;
 
-     cudaErr = cudaStreamQuery(streams[i]);
-     if (cudaErr == cudaSuccess) {
+     hipErr = hipStreamQuery(streams[i]);
+     if (hipErr == hipSuccess) {
        done[i] = 1;
        remaining--;
        idle = 0;
        continue;
      }
 
-     if (cudaErr != cudaErrorNotReady) CUDACHECK(cudaErr);
+     if (hipErr != hipErrorNotReady) HIPCHECK(hipErr);
 
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,4,0)
      if (test_ncclVersion >= NCCL_VERSION(2,4,0) && comms) {
@@ -727,7 +726,7 @@ testResult_t startColl(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
   if (args->nGpus > 1) NCCLCHECK(ncclGroupStart());
   for (int i = 0; i < args->nGpus; i++) {
 #ifndef NCCL_MAJOR
-    CUDACHECK(cudaSetDevice(args->gpus[i]));
+    HIPCHECK(hipSetDevice(args->gpus[i]));
 #endif
     int rank = ((args->proc*args->nThreads + args->thread)*args->nGpus + i);
     char* recvBuff = ((char*)args->recvbuffs[i]) + shift;
@@ -820,16 +819,16 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
   Barrier(args);
 
 #if HIP_VERSION >= 50221310
-  std::vector<cudaGraph_t> graphs(args->nGpus);
-  std::vector<cudaGraphExec_t> graphExec(args->nGpus);
-  if (cudaGraphLaunches >= 1) {
-    // Begin cuda graph capture
+  std::vector<hipGraph_t> graphs(args->nGpus);
+  std::vector<hipGraphExec_t> graphExec(args->nGpus);
+  if (graphLaunches >= 1) {
+    // Begin HIP graph capture
     for (int i=0; i<args->nGpus; i++) {
       // Thread local mdoe is needed for:
       // - Multi-thread mode: where graph capture and instantiation can happen concurrently across threads
       // - P2P pre-connect: when there is no warm-up, P2P pre-connect is done during graph capture.
-      //   Since pre-connect calls cudaMalloc, we cannot use global capture mode
-      CUDACHECK(cudaStreamBeginCapture(args->streams[i], cudaStreamCaptureModeThreadLocal));
+      //   Since pre-connect calls hipMalloc, we cannot use global capture mode
+      HIPCHECK(hipStreamBeginCapture(args->streams[i], hipStreamCaptureModeThreadLocal));
     }
   }
 #endif
@@ -845,21 +844,21 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
   }
 
 #if HIP_VERSION >= 50221310
-  if (cudaGraphLaunches >= 1) {
-    // End cuda graph capture
+  if (graphLaunches >= 1) {
+    // End HIP graph capture
     for (int i=0; i<args->nGpus; i++) {
-      CUDACHECK(cudaStreamEndCapture(args->streams[i], graphs.data()+i));
+      HIPCHECK(hipStreamEndCapture(args->streams[i], graphs.data()+i));
     }
-    // Instantiate cuda graph
+    // Instantiate HIP graph
     for (int i=0; i<args->nGpus; i++) {
-      CUDACHECK(cudaGraphInstantiate(graphExec.data()+i, graphs[i], NULL, NULL, 0));
+      HIPCHECK(hipGraphInstantiate(graphExec.data()+i, graphs[i], NULL, NULL, 0));
     }
-    // Resync CPU, restart timing, launch cuda graph
+    // Resync CPU, restart timing, launch HIP graph
     Barrier(args);
     tim.reset();
-    for (int l=0; l<cudaGraphLaunches; l++) {
+    for (int l=0; l<graphLaunches; l++) {
       for (int i=0; i<args->nGpus; i++) {
-        CUDACHECK(cudaGraphLaunch(graphExec[i], args->streams[i]));
+        HIPCHECK(hipGraphLaunch(graphExec[i], args->streams[i]));
       }
     }
   }
@@ -870,15 +869,15 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
 
   double deltaSec = tim.elapsed();
   deltaSec = deltaSec/(iters*agg_iters);
-  if (cudaGraphLaunches >= 1) deltaSec = deltaSec/cudaGraphLaunches;
+  if (graphLaunches >= 1) deltaSec = deltaSec/graphLaunches;
   Allreduce(args, &deltaSec, average);
 
 #if HIP_VERSION >= 50221310
-  if (cudaGraphLaunches >= 1) {
-    //destroy cuda graph
+  if (graphLaunches >= 1) {
+    //destroy HIP graph
     for (int i=0; i<args->nGpus; i++) {
-      CUDACHECK(cudaGraphExecDestroy(graphExec[i]));
-      CUDACHECK(cudaGraphDestroy(graphs[i]));
+      HIPCHECK(hipGraphExecDestroy(graphExec[i]));
+      HIPCHECK(hipGraphDestroy(graphs[i]));
     }
   }
 #endif
@@ -896,10 +895,10 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
       TESTCHECK(args->collTest->initData(args, type, op, root, rep, in_place));
 
 #if HIP_VERSION >= 50221310
-      if (cudaGraphLaunches >= 1) {
-        // Begin cuda graph capture for data check
+      if (graphLaunches >= 1) {
+        // Begin HIP graph capture for data check
         for (int i=0; i<args->nGpus; i++) {
-          CUDACHECK(cudaStreamBeginCapture(args->streams[i], args->nThreads > 1 ? cudaStreamCaptureModeThreadLocal : cudaStreamCaptureModeGlobal));
+          HIPCHECK(hipStreamBeginCapture(args->streams[i], args->nThreads > 1 ? hipStreamCaptureModeThreadLocal : hipStreamCaptureModeGlobal));
         }
       }
 #endif
@@ -908,18 +907,18 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
       TESTCHECK(startColl(args, type, op, root, in_place, 0));
 
 #if HIP_VERSION >= 50221310
-      if (cudaGraphLaunches >= 1) {
-        // End cuda graph capture
+      if (graphLaunches >= 1) {
+        // End HIP graph capture
         for (int i=0; i<args->nGpus; i++) {
-          CUDACHECK(cudaStreamEndCapture(args->streams[i], graphs.data()+i));
+          HIPCHECK(hipStreamEndCapture(args->streams[i], graphs.data()+i));
         }
-        // Instantiate cuda graph
+        // Instantiate HIP graph
         for (int i=0; i<args->nGpus; i++) {
-          CUDACHECK(cudaGraphInstantiate(graphExec.data()+i, graphs[i], NULL, NULL, 0));
+          HIPCHECK(hipGraphInstantiate(graphExec.data()+i, graphs[i], NULL, NULL, 0));
         }
-        // Launch cuda graph
+        // Launch HIP graph
         for (int i=0; i<args->nGpus; i++) {
-          CUDACHECK(cudaGraphLaunch(graphExec[i], args->streams[i]));
+          HIPCHECK(hipGraphLaunch(graphExec[i], args->streams[i]));
         }
       }
 #endif
@@ -927,11 +926,11 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
       TESTCHECK(completeColl(args));
 
 #if HIP_VERSION >= 50221310
-      if (cudaGraphLaunches >= 1) {
-        //destroy cuda graph
+      if (graphLaunches >= 1) {
+        //destroy HIP graph
         for (int i=0; i<args->nGpus; i++) {
-          CUDACHECK(cudaGraphExecDestroy(graphExec[i]));
-          CUDACHECK(cudaGraphDestroy(graphs[i]));
+          HIPCHECK(hipGraphExecDestroy(graphExec[i]));
+          HIPCHECK(hipGraphDestroy(graphs[i]));
         }
       }
 #endif
@@ -996,16 +995,16 @@ testResult_t TimeTest(struct threadArgs* args, ncclDataType_t type, const char* 
   // Warm-up for large size
   setupArgs(args->maxbytes, type, args);
 #if HIP_VERSION >= 50221310
-  std::vector<cudaGraph_t> graphs(args->nGpus);
-  std::vector<cudaGraphExec_t> graphExec(args->nGpus);
-  if (cudaGraphLaunches >= 1) {
-    // Begin cuda graph capture
+  std::vector<hipGraph_t> graphs(args->nGpus);
+  std::vector<hipGraphExec_t> graphExec(args->nGpus);
+  if (graphLaunches >= 1) {
+    // Begin HIP graph capture
     for (int i=0; i<args->nGpus; i++) {
       // Thread local mode is needed for:
       // - Multi-thread mode: where graph capture and instantiation can happen concurrently across threads
       // - P2P pre-connect: when there is no warm-up, P2P pre-connect is done during graph capture.
-      //   Since pre-connect calls cudaMalloc, we cannot use global capture mode
-      CUDACHECK(cudaStreamBeginCapture(args->streams[i], cudaStreamCaptureModeThreadLocal));
+      //   Since pre-connect calls hipMalloc, we cannot use global capture mode
+      HIPCHECK(hipStreamBeginCapture(args->streams[i], hipStreamCaptureModeThreadLocal));
     }
   }
 #endif
@@ -1014,20 +1013,20 @@ testResult_t TimeTest(struct threadArgs* args, ncclDataType_t type, const char* 
   }
 
 #if HIP_VERSION >= 50221310
-  if (cudaGraphLaunches >= 1) {
-    // End cuda graph capture
+  if (graphLaunches >= 1) {
+    // End HIP graph capture
     for (int i=0; i<args->nGpus; i++) {
-      CUDACHECK(cudaStreamEndCapture(args->streams[i], graphs.data()+i));
+      HIPCHECK(hipStreamEndCapture(args->streams[i], graphs.data()+i));
     }
-    // Instantiate cuda graph
+    // Instantiate HIP graph
     for (int i=0; i<args->nGpus; i++) {
-      CUDACHECK(cudaGraphInstantiate(graphExec.data()+i, graphs[i], NULL, NULL, 0));
+      HIPCHECK(hipGraphInstantiate(graphExec.data()+i, graphs[i], NULL, NULL, 0));
     }
-    // Resync CPU, restart timing, launch cuda graph
+    // Resync CPU, restart timing, launch HIP graph
     Barrier(args);
-    for (int l=0; l<cudaGraphLaunches; l++) {
+    for (int l=0; l<graphLaunches; l++) {
       for (int i=0; i<args->nGpus; i++) {
-        CUDACHECK(cudaGraphLaunch(graphExec[i], args->streams[i]));
+        HIPCHECK(hipGraphLaunch(graphExec[i], args->streams[i]));
       }
     }
   }
@@ -1036,11 +1035,11 @@ testResult_t TimeTest(struct threadArgs* args, ncclDataType_t type, const char* 
   TESTCHECK(completeColl(args));
 
 #if HIP_VERSION >= 50221310
-  if (cudaGraphLaunches >= 1) {
-    //destroy cuda graph
+  if (graphLaunches >= 1) {
+    //destroy HIP graph
     for (int i=0; i<args->nGpus; i++) {
-      CUDACHECK(cudaGraphExecDestroy(graphExec[i]));
-      CUDACHECK(cudaGraphDestroy(graphs[i]));
+      HIPCHECK(hipGraphExecDestroy(graphExec[i]));
+      HIPCHECK(hipGraphDestroy(graphs[i]));
     }
   }
 #endif
@@ -1048,14 +1047,14 @@ testResult_t TimeTest(struct threadArgs* args, ncclDataType_t type, const char* 
   // Warm-up for small size
   setupArgs(args->minbytes, type, args);
 #if HIP_VERSION >= 50221310
-  if (cudaGraphLaunches >= 1) {
-    // Begin cuda graph capture
+  if (graphLaunches >= 1) {
+    // Begin HIP graph capture
     for (int i=0; i<args->nGpus; i++) {
       // Thread local mode is needed for:
       // - Multi-thread mode: where graph capture and instantiation can happen concurrently across threads
       // - P2P pre-connect: when there is no warm-up, P2P pre-connect is done during graph capture.
-      //   Since pre-connect calls cudaMalloc, we cannot use global capture mode
-      CUDACHECK(cudaStreamBeginCapture(args->streams[i], cudaStreamCaptureModeThreadLocal));
+      //   Since pre-connect calls hipMalloc, we cannot use global capture mode
+      HIPCHECK(hipStreamBeginCapture(args->streams[i], hipStreamCaptureModeThreadLocal));
     }
   }
 #endif
@@ -1064,20 +1063,20 @@ testResult_t TimeTest(struct threadArgs* args, ncclDataType_t type, const char* 
   }
 
 #if HIP_VERSION >= 50221310
-  if (cudaGraphLaunches >= 1) {
-    // End cuda graph capture
+  if (graphLaunches >= 1) {
+    // End HIP graph capture
     for (int i=0; i<args->nGpus; i++) {
-      CUDACHECK(cudaStreamEndCapture(args->streams[i], graphs.data()+i));
+      HIPCHECK(hipStreamEndCapture(args->streams[i], graphs.data()+i));
     }
-    // Instantiate cuda graph
+    // Instantiate HIP graph
     for (int i=0; i<args->nGpus; i++) {
-      CUDACHECK(cudaGraphInstantiate(graphExec.data()+i, graphs[i], NULL, NULL, 0));
+      HIPCHECK(hipGraphInstantiate(graphExec.data()+i, graphs[i], NULL, NULL, 0));
     }
-    // Resync CPU, restart timing, launch cuda graph
+    // Resync CPU, restart timing, launch HIP graph
     Barrier(args);
-    for (int l=0; l<cudaGraphLaunches; l++) {
+    for (int l=0; l<graphLaunches; l++) {
       for (int i=0; i<args->nGpus; i++) {
-        CUDACHECK(cudaGraphLaunch(graphExec[i], args->streams[i]));
+        HIPCHECK(hipGraphLaunch(graphExec[i], args->streams[i]));
       }
     }
   }
@@ -1086,11 +1085,11 @@ testResult_t TimeTest(struct threadArgs* args, ncclDataType_t type, const char* 
   TESTCHECK(completeColl(args));
 
 #if HIP_VERSION >= 50221310
-  if (cudaGraphLaunches >= 1) {
-    //destroy cuda graph
+  if (graphLaunches >= 1) {
+    //destroy HIP graph
     for (int i=0; i<args->nGpus; i++) {
-      CUDACHECK(cudaGraphExecDestroy(graphExec[i]));
-      CUDACHECK(cudaGraphDestroy(graphs[i]));
+      HIPCHECK(hipGraphExecDestroy(graphExec[i]));
+      HIPCHECK(hipGraphDestroy(graphs[i]));
     }
   }
 #endif
@@ -1128,7 +1127,7 @@ testResult_t threadRunTests(struct threadArgs* args) {
   // Set device to the first of our GPUs. If we don't do that, some operations
   // will be done on the current GPU (by default : 0) and if the GPUs are in
   // exclusive mode those operations will fail.
-  CUDACHECK(cudaSetDevice(args->gpus[0]));
+  HIPCHECK(hipSetDevice(args->gpus[0]));
   TESTCHECK(ncclTestEngine.runTest(args, ncclroot, (ncclDataType_t)nccltype, test_typenames[nccltype], (ncclRedOp_t)ncclop, test_opnames[ncclop]));
   return testSuccess;
 }
@@ -1144,7 +1143,7 @@ testResult_t threadInit(struct threadArgs* args) {
   NCCLCHECK(ncclGroupStart());
   for (int i=0; i<args->nGpus; i++) {
     int rank = args->proc*args->nThreads*args->nGpus + args->thread*args->nGpus + i;
-    CUDACHECK(cudaSetDevice(args->gpus[i]));
+    HIPCHECK(hipSetDevice(args->gpus[i]));
     NCCLCHECK(ncclCommInitRank(args->comms+i, nranks, args->ncclId, rank));
   }
   NCCLCHECK(ncclGroupEnd());
@@ -1202,29 +1201,29 @@ testResult_t AllocateBuffs(void **sendbuff, size_t sendBytes, void **recvbuff, s
   }
   if (memorytype == ncclFine) {
     if(HIP_VERSION >= 50700000) {
-      CUDACHECK(hipExtMallocWithFlags(sendbuff, nbytes, hipDeviceMallocUncached));
-      CUDACHECK(hipExtMallocWithFlags(recvbuff, nbytes, hipDeviceMallocUncached));
-      if (datacheck) CUDACHECK(hipExtMallocWithFlags(expected, recvBytes, hipDeviceMallocUncached));
+      HIPCHECK(hipExtMallocWithFlags(sendbuff, nbytes, hipDeviceMallocUncached));
+      HIPCHECK(hipExtMallocWithFlags(recvbuff, nbytes, hipDeviceMallocUncached));
+      if (datacheck) HIPCHECK(hipExtMallocWithFlags(expected, recvBytes, hipDeviceMallocUncached));
     }
     else {
-      CUDACHECK(hipExtMallocWithFlags(sendbuff, nbytes, hipDeviceMallocFinegrained));
-      CUDACHECK(hipExtMallocWithFlags(recvbuff, nbytes, hipDeviceMallocFinegrained));
-      if (datacheck) CUDACHECK(hipExtMallocWithFlags(expected, recvBytes, hipDeviceMallocFinegrained));
+      HIPCHECK(hipExtMallocWithFlags(sendbuff, nbytes, hipDeviceMallocFinegrained));
+      HIPCHECK(hipExtMallocWithFlags(recvbuff, nbytes, hipDeviceMallocFinegrained));
+      if (datacheck) HIPCHECK(hipExtMallocWithFlags(expected, recvBytes, hipDeviceMallocFinegrained));
     }
   }
   else if (memorytype == ncclHost) {
-    CUDACHECK(hipHostMalloc(sendbuff, nbytes));
-    CUDACHECK(hipHostMalloc(recvbuff, nbytes));
-    if (datacheck) CUDACHECK(hipHostMalloc(expected, recvBytes));
+    HIPCHECK(hipHostMalloc(sendbuff, nbytes));
+    HIPCHECK(hipHostMalloc(recvbuff, nbytes));
+    if (datacheck) HIPCHECK(hipHostMalloc(expected, recvBytes));
   }
   else if (memorytype == ncclManaged) {
-    CUDACHECK(cudaMallocManaged(sendbuff, nbytes));
-    CUDACHECK(cudaMallocManaged(recvbuff, nbytes));
-    if (datacheck) CUDACHECK(cudaMallocManaged(expected, recvBytes));
+    HIPCHECK(hipMallocManaged(sendbuff, nbytes));
+    HIPCHECK(hipMallocManaged(recvbuff, nbytes));
+    if (datacheck) HIPCHECK(hipMallocManaged(expected, recvBytes));
 #if 0
-    CUDACHECK(cudaMemset(*sendbuff, 0, nbytes));
-    CUDACHECK(cudaMemset(*recvbuff, 0, nbytes));
-    if (datacheck) CUDACHECK(cudaMemset(*expected, 0, recvBytes));
+    HIPCHECK(hipMemset(*sendbuff, 0, nbytes));
+    HIPCHECK(hipMemset(*recvbuff, 0, nbytes));
+    if (datacheck) HIPCHECK(hipMemset(*expected, 0, recvBytes));
 #endif
   }
   else {
@@ -1233,13 +1232,13 @@ testResult_t AllocateBuffs(void **sendbuff, size_t sendBytes, void **recvbuff, s
     NCCLCHECK(ncclMemAlloc(recvbuff, nbytes));
     if (datacheck) NCCLCHECK(ncclMemAlloc(expected, recvBytes));
 #else
-    CUDACHECK(cudaMalloc(sendbuff, nbytes));
-    CUDACHECK(cudaMalloc(recvbuff, nbytes));
-    if (datacheck) CUDACHECK(cudaMalloc(expected, recvBytes));
+    HIPCHECK(hipMalloc(sendbuff, nbytes));
+    HIPCHECK(hipMalloc(recvbuff, nbytes));
+    if (datacheck) HIPCHECK(hipMalloc(expected, recvBytes));
 #endif
   }
-  CUDACHECK(hipMemset(*sendbuff, 1, nbytes));
-  if (datacheck) CUDACHECK(hipMemset(*expected, 1, recvBytes));
+  HIPCHECK(hipMemset(*sendbuff, 1, nbytes));
+  if (datacheck) HIPCHECK(hipMemset(*expected, 1, recvBytes));
   return testSuccess;
 }
 
@@ -1304,7 +1303,7 @@ int main(int argc, char* argv[]) {
     {"blocking", required_argument, 0, 'z'},
     {"stream_null", required_argument, 0, 'y'},
     {"timeout", required_argument, 0, 'T'},
-    {"cudagraph", required_argument, 0, 'G'},
+    {"hipgraph", required_argument, 0, 'G'},
     {"report_cputime", required_argument, 0, 'C'},
     {"average", required_argument, 0, 'a'},
     {"local_register", required_argument, 0, 'R'},
@@ -1404,7 +1403,7 @@ int main(int argc, char* argv[]) {
         break;
       case 'G':
 #if (NCCL_MAJOR > 2 || (NCCL_MAJOR >= 2 && NCCL_MINOR >= 9)) && HIP_VERSION >= 50221310
-        cudaGraphLaunches = strtol(optarg, NULL, 0);
+        graphLaunches = strtol(optarg, NULL, 0);
 #else
         printf("Option -G (HIP graph) not supported before NCCL 2.9 + ROCm 5.2 Ignoring\n");
 #endif
@@ -1491,7 +1490,7 @@ int main(int argc, char* argv[]) {
             "[-z,--blocking <0/1>] \n\t"
             "[-y,--stream_null <0/1>] \n\t"
             "[-T,--timeout <time in seconds>] \n\t"
-            "[-G,--cudagraph <num graph launches>] \n\t"
+            "[-G,--hipgraph <num graph launches>] \n\t"
             "[-C,--report_cputime <0/1>] \n\t"
             "[-a,--average <0/1/2/3> report average iteration time <0=RANK0/1=AVG/2=MIN/3=MAX>] \n\t"
             "[-R,--local_register <0/1/2> enable local (1) or symmetric (2) buffer registration on send/recv buffers (default: disable (0))] \n\t"
@@ -1509,7 +1508,7 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  CUDACHECK(cudaGetDeviceCount(&numDevices));
+  HIPCHECK(hipGetDeviceCount(&numDevices));
 #ifndef MPI_SUPPORT
   if (nGpus > numDevices)
   {
@@ -1564,7 +1563,7 @@ testResult_t run() {
   getHostName(hostname, 1024);
 
   hipDeviceProp_t devProp;
-  CUDACHECK(hipGetDeviceProperties(&devProp, 0));
+  HIPCHECK(hipGetDeviceProperties(&devProp, 0));
   if (IsArchMatch(devProp.gcnArchName, "gfx942")) {
     PRINT("On gfx942 architecture, using FNUZ FP8 types");
     rccl_float8_useFnuz = true;
@@ -1627,7 +1626,7 @@ testResult_t run() {
   PRINT("# nThread %d nGpus %d minBytes %ld maxBytes %ld step: %ld(%s) warmup iters: %d iters: %d agg iters: %d validation: %d graph: %d\n",
         nThreads, nGpus, minBytes, maxBytes,
         (stepFactor > 1)?stepFactor:stepBytes, (stepFactor > 1)?"factor":"bytes",
-        warmup_iters, iters, agg_iters, datacheck, cudaGraphLaunches);
+        warmup_iters, iters, agg_iters, datacheck, graphLaunches);
   if (blocking_coll) PRINT("# Blocking Enabled: wait for completion and barrier after each collective \n");
   if (parallel_init) PRINT("# Parallel Init Enabled: threads call into NcclInitRank concurrently \n");
   PRINT("#\n");
@@ -1640,16 +1639,16 @@ testResult_t run() {
   char* envstr = getenv("NCCL_TESTS_DEVICE");
   int gpu0 = envstr ? atoi(envstr) : -1;
   for (int i=0; i<nThreads*nGpus; i++) {
-    int cudaDev = ((gpu0 != -1 ? gpu0 : localRank*nThreads*nGpus) + i)%numDevices;
+    int deviceIndex = ((gpu0 != -1 ? gpu0 : localRank*nThreads*nGpus) + i)%numDevices;
     int rank = proc*nThreads*nGpus+i;
-    cudaDeviceProp prop;
-    CUDACHECK(cudaGetDeviceProperties(&prop, cudaDev));
+    hipDeviceProp_t prop;
+    HIPCHECK(hipGetDeviceProperties(&prop, deviceIndex));
     //char busIdStr[] = "00000000:00:00.0";
-    //CUDACHECK(cudaDeviceGetPCIBusId(busIdStr, sizeof(busIdStr), cudaDev));
+    //HIPCHECK(hipDeviceGetPCIBusId(busIdStr, sizeof(busIdStr), deviceIndex));
     //len += snprintf(line+len, MAX_LINE>len ? MAX_LINE-len : 0, "#  Rank %2d Group %2d Pid %6d on %10s device %2d [%04x:%s:%02x] %s\n",
-    //                rank, color, getpid(), hostname, cudaDev, prop.pciDomainID, busIdStr, prop.pciDeviceID, prop.name);
+    //                rank, color, getpid(), hostname, deviceIndex, prop.pciDomainID, busIdStr, prop.pciDeviceID, prop.name);
     len += snprintf(line+len, MAX_LINE>len ? MAX_LINE-len : 0, "#  Rank %2d Group %2d Pid %6d on %10s device %2d [%04x:%02x:%02x] %s\n",
-                    rank, color, getpid(), hostname, cudaDev, prop.pciDomainID, prop.pciBusID, prop.pciDeviceID, prop.name);
+                    rank, color, getpid(), hostname, deviceIndex, prop.pciDomainID, prop.pciBusID, prop.pciDeviceID, prop.name);
     maxMem = std::min(maxMem, prop.totalGlobalMem);
   }
 #if MPI_SUPPORT
@@ -1687,7 +1686,7 @@ testResult_t run() {
 #endif
 
   std::vector<int> gpus(nGpus*nThreads);
-  std::vector<cudaStream_t> streams(nGpus*nThreads);
+  std::vector<hipStream_t> streams(nGpus*nThreads);
   std::vector<void*> sendbuffs(nGpus*nThreads);
   std::vector<void*> recvbuffs(nGpus*nThreads);
   std::vector<void*> expected(nGpus*nThreads);
@@ -1699,26 +1698,26 @@ testResult_t run() {
   gpu0 = envstr ? atoi(envstr) : -1;
   for (int i=0; i<nGpus*nThreads; i++) {
     gpus[i] = ((gpu0 != -1 ? gpu0 : localRank*nThreads*nGpus) + i)%numDevices;
-    CUDACHECK(cudaSetDevice(gpus[i]));
+    HIPCHECK(hipSetDevice(gpus[i]));
     TESTCHECK(AllocateBuffs(sendbuffs.data()+i, sendBytes, recvbuffs.data()+i, recvBytes, expected.data()+i, (size_t)maxBytes));
     if (streamnull) {
       streams[i] = NULL;
     }
     else {
-      CUDACHECK(cudaStreamCreateWithFlags(streams.data()+i, cudaStreamNonBlocking));
+      HIPCHECK(hipStreamCreateWithFlags(streams.data()+i, hipStreamNonBlocking));
     }
     int archMajor, archMinor;
-    CUDACHECK(cudaDeviceGetAttribute(&archMajor, cudaDevAttrComputeCapabilityMajor, gpus[i]));
-    CUDACHECK(cudaDeviceGetAttribute(&archMinor, cudaDevAttrComputeCapabilityMinor, gpus[i]));
-    minCudaArch = std::min(minCudaArch, 100*archMajor + 10*archMinor);
+    HIPCHECK(hipDeviceGetAttribute(&archMajor, hipDeviceAttributeComputeCapabilityMajor, gpus[i]));
+    HIPCHECK(hipDeviceGetAttribute(&archMinor, hipDeviceAttributeComputeCapabilityMinor, gpus[i]));
+    minHipArch = std::min(minHipArch, 100*archMajor + 10*archMinor);
   }
 
 #ifdef MPI_SUPPORT
-  MPI_Allreduce(MPI_IN_PLACE, &minCudaArch, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+  MPI_Allreduce(MPI_IN_PLACE, &minHipArch, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
 #endif
 #if defined(RCCL_FLOAT8)
   if (NCCL_VERSION_CODE >= NCCL_VERSION(2,24,0) && test_ncclVersion >= NCCL_VERSION(2,24,0)) {
-    if (minCudaArch < 900) { // Filter out fp8 on pre-Hopper hardware
+    if (minHipArch < 900) { // Filter out fp8 on pre-Hopper hardware
       int n = 0;
       for (int i=0; i < test_typenum; i++) {
         if (!(test_types[i] == ncclFloat8e4m3 || test_types[i] == ncclFloat8e5m2)) {
@@ -1744,7 +1743,7 @@ testResult_t run() {
      } else {
        NCCLCHECK(ncclGroupStart());
        for (int i=0; i<nGpus*nThreads; i++) {
-         CUDACHECK(cudaSetDevice(gpus[i]));
+         HIPCHECK(hipSetDevice(gpus[i]));
          NCCLCHECK(ncclCommInitRank(comms+i, ncclProcs*nThreads*nGpus, ncclId, ncclProc*nThreads*nGpus+i));
        }
        NCCLCHECK(ncclGroupEnd());
@@ -1772,7 +1771,7 @@ testResult_t run() {
   std::vector<int> errors(nThreads);
   std::vector<double> bw(nThreads);
   double* delta;
-  CUDACHECK(hipHostMalloc(&delta, sizeof(double)*nThreads*NUM_BLOCKS, cudaHostAllocPortable | cudaHostAllocMapped));
+  HIPCHECK(hipHostMalloc(&delta, sizeof(double)*nThreads*NUM_BLOCKS, hipHostMallocPortable | hipHostMallocMapped));
   std::vector<int> bw_count(nThreads);
   for (int t=0; t<nThreads; t++) {
     bw[t] = 0.0;
@@ -1881,19 +1880,19 @@ testResult_t run() {
     free(comms);
   }
 
-  // Free off CUDA allocated memory
+  // Free off HIP allocated memory
   for (int i=0; i<nGpus*nThreads; i++) {
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,19,0)
     if (sendbuffs[i]) NCCLCHECK(ncclMemFree((char*)sendbuffs[i]));
     if (recvbuffs[i]) NCCLCHECK(ncclMemFree((char*)recvbuffs[i]));
     if (datacheck) NCCLCHECK(ncclMemFree(expected[i]));
 #else
-    if (sendbuffs[i]) CUDACHECK(cudaFree((char*)sendbuffs[i]));
-    if (recvbuffs[i]) CUDACHECK(cudaFree((char*)recvbuffs[i]));
-    if (datacheck) CUDACHECK(cudaFree(expected[i]));
+    if (sendbuffs[i]) HIPCHECK(hipFree((char*)sendbuffs[i]));
+    if (recvbuffs[i]) HIPCHECK(hipFree((char*)recvbuffs[i]));
+    if (datacheck) HIPCHECK(hipFree(expected[i]));
 #endif
   }
-  CUDACHECK(cudaFreeHost(delta));
+  HIPCHECK(hipHostFree(delta));
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,19,0)
   free(sendRegHandles);
   free(recvRegHandles);
@@ -1915,9 +1914,9 @@ testResult_t run() {
 
   reporter.writeFile();
 
-  // 'cuda-memcheck --leak-check full' requires this
+  // 保留设备上下文，方便使用 hip-memcheck 等工具进行内存泄漏检查
   PRINT("%s\n", ncclGetLastError(NULL));
-  cudaDeviceReset();
+  hipDeviceReset();
 
   if (errors[0] || bw[0] < check_avg_bw*(0.9))
     exit(EXIT_FAILURE);

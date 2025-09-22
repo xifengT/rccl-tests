@@ -8,7 +8,7 @@
 #ifndef _d41d8cd98f00b204e9800998ecf8427e
 #define _d41d8cd98f00b204e9800998ecf8427e
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <stdint.h>
 
@@ -43,17 +43,17 @@ __host__ __device__ T ncclVerifiablePremulScalar(int rank_me) {
 // Enqueue kernel to generate data which is to be reduced.
 hipError_t ncclVerifiablePrepareInput(
   void *elts, intptr_t elt_n, int elt_ty, int red_op, int rank_n, int rank_me,
-  uint64_t seed, intptr_t elt_ix0, cudaStream_t stream
+  uint64_t seed, intptr_t elt_ix0, hipStream_t stream
 );
 
 // Enqueue kernel to generate expected results of reduction.
 hipError_t ncclVerifiablePrepareExpected(
   void *elts, intptr_t elt_n, int elt_ty, int red_op, int rank_n,
-  uint64_t seed, intptr_t elt_ix0, cudaStream_t stream
+  uint64_t seed, intptr_t elt_ix0, hipStream_t stream
 );
 
 // Enqueue kernel to verify reduced data matches expectation. The number of
-// failed elements is written to bad_elt_n which must be in cudaHost memory.
+// failed elements is written to bad_elt_n which must be in hipHost memory.
 // If `expected == nullptr` then the expected results are generated on-the-fly
 // which can be costly. Thus if you plan to run the same reduction multiple
 // times it is advantageous to precompute the expected values with
@@ -61,7 +61,7 @@ hipError_t ncclVerifiablePrepareExpected(
 hipError_t ncclVerifiableVerify(
   void const *results, void const *expected, intptr_t elt_n, int elt_ty,
   int red_op, int rank_n, uint64_t seed, intptr_t elt_ix0,
-  int64_t *bad_elt_n, cudaStream_t stream
+  int64_t *bad_elt_n, hipStream_t stream
 );
 
 #ifdef NCCL_VERIFIABLE_SELF_TEST

@@ -24,7 +24,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <hip/hip_bfloat16.h>
-#include <cuda_fp16.h>
+#include <hip/hip_fp16.h>
 
 using std::uint64_t;
 using std::uint32_t;
@@ -182,14 +182,14 @@ __global__ void kernel() {
 int main() {
   std::printf("type=float:\n");
   kernel<float><<<1,32>>>();
-  cudaDeviceSynchronize();
+  hipDeviceSynchronize();
 
   std::printf("\ntype=half:\n");
   kernel<half><<<1,32>>>();
-  cudaDeviceSynchronize();
+  hipDeviceSynchronize();
 
   std::printf("\ntype=bfloat16:\n");
   kernel<bfloat16><<<1,32>>>();
-  cudaDeviceSynchronize();
+  hipDeviceSynchronize();
   return 0;
 }

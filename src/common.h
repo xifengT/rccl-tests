@@ -9,6 +9,7 @@
 #define __COMMON_H__
 
 #include "rccl/rccl.h"
+#include <hip/hip_runtime.h>
 #include <stdio.h>
 #include <cstdint>
 #include <cstring>
@@ -36,16 +37,16 @@
 // For nccl.h < 2.13 since we define a weak fallback
 extern "C" char const* ncclGetLastError(ncclComm_t comm);
 
-#define CUDACHECK(cmd) do {                         \
-  cudaError_t err = cmd;                            \
-  if( err != cudaSuccess ) {                        \
-    char hostname[1024];                            \
-    getHostName(hostname, 1024);                    \
-    printf("%s: Test CUDA failure %s:%d '%s'\n",    \
-         hostname,                                  \
-        __FILE__,__LINE__,cudaGetErrorString(err)); \
-    return testCudaError;                           \
-  }                                                 \
+#define HIPCHECK(cmd) do {                          \
+  hipError_t err = cmd;                            \
+  if( err != hipSuccess ) {                        \
+    char hostname[1024];                           \
+    getHostName(hostname, 1024);                   \
+    printf("%s: Test HIP failure %s:%d '%s'\n",    \
+         hostname,                                 \
+        __FILE__,__LINE__,hipGetErrorString(err)); \
+    return testHipError;                           \
+  }                                                \
 } while(0)
 
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,13,0)
@@ -79,7 +80,7 @@ extern "C" char const* ncclGetLastError(ncclComm_t comm);
 typedef enum {
   testSuccess = 0,
   testInternalError = 1,
-  testCudaError = 2,
+  testHipError = 2,
   testNcclError = 3,
   testTimeout = 4,
   testNumResults = 5
@@ -108,7 +109,7 @@ struct testColl {
       ncclRedOp_t op, int root, int rep, int in_place);
   void (*getBw)(size_t count, int typesize, double sec, double* algBw, double* busBw, int nranks);
   testResult_t (*runColl)(void* sendbuff, void* recvbuff, size_t count, ncclDataType_t type,
-      ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream);
+      ncclRedOp_t op, int root, ncclComm_t comm, hipStream_t stream);
 };
 extern struct testColl allReduceTest;
 extern struct testColl allGatherTest;
@@ -174,7 +175,7 @@ struct threadArgs {
   size_t recvInplaceOffset;
   ncclUniqueId ncclId;
   ncclComm_t* comms;
-  cudaStream_t* streams;
+  hipStream_t* streams;
 
   void** expected;
   size_t expectedBytes;

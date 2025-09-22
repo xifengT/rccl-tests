@@ -134,7 +134,53 @@ add_custom_target(git_version_check
 add_custom_target(hipify DEPENDS ${HIP_COMMON_SOURCES})
 add_library(rccl_common OBJECT ${HIP_COMMON_SOURCES})
 add_dependencies(rccl_common hipify git_version_check)
-target_link_libraries(rccl_common roc::rccl hip::device Threads::Threads)
+target_link_libraries(rccl_common PUBLIC Threads::Threads)
+
+if (WIN32)
+  # ====== Windows 平台: 根据本地环境配置 HIP/RCCL 的头文件与库路径 ======
+  set(LLVM_PREBUILD_PATH "D:/xudong/HIP/llvm-lst-install" CACHE PATH "HIP LLVM 预编译路径（示例值，可按需修改）")
+  set(DEVLIB_PREBUILD_PATH "D:/xudong/HIP/devlib-lst-install" CACHE PATH "ROCm 设备库路径（示例值，可按需修改）")
+  set(HIP_PREBUILD_PATH   "D:/xudong/HIP/hip-install"       CACHE PATH "HIP SDK 根目录（示例值，可按需修改）")
+  set(HIP_WINDOWS_OFFLOAD_ARCH "g100" CACHE STRING "需要启用的 GPU 架构（示例值，可替换为本机实际架构）")
+
+  target_include_directories(rccl_common
+    PUBLIC
+      "${HIP_PREBUILD_PATH}/include"        # HIP 头文件目录
+      "${RCCL_INCLUDE_DIRS}"               # RCCL 头文件目录（需按实际情况调整）
+  )
+  target_link_directories(rccl_common
+    PUBLIC
+      "${HIP_PREBUILD_PATH}/lib"           # HIP 库目录
+      "${RCCL_WINDOWS_LIBRARY_DIR}"        # RCCL 库目录（示例路径，可修改）
+  )
+  target_compile_options(rccl_common
+    PUBLIC
+      -v                                    # 对应批处理里的 -v
+      -g                                    # 生成调试信息，便于排查问题
+      -O2                                   # 与批处理保持一致的优化等级
+      --offload-arch=${HIP_WINDOWS_OFFLOAD_ARCH}      # 设备架构（示例：g100）
+      -DHIP_PLATFORM=amd                    # AMD 平台编译宏
+      -x hip                                # 明确使用 HIP 前端
+      --rocm-path=${LLVM_PREBUILD_PATH}/lib # HIP 编译阶段需要的 ROCm 路径
+      --rocm-device-lib-path=${DEVLIB_PREBUILD_PATH}/amdgcn/bitcode # 设备 bitcode 路径
+  )
+  target_link_options(rccl_common
+    PUBLIC
+      -v
+      --offload-arch=${HIP_WINDOWS_OFFLOAD_ARCH}
+      --rocm-path=${LLVM_PREBUILD_PATH}/lib
+      --rocm-device-lib-path=${DEVLIB_PREBUILD_PATH}/amdgcn/bitcode
+  )
+  target_link_libraries(rccl_common
+    PUBLIC
+      hip::device                           # HIP CMake 目标，包含通用依赖
+      amdhip64                              # HIP 运行时（示例值，可根据需要调整）
+      hiprtc                                # HIP RTC 库（示例值，可根据需要调整）
+      ${RCCL_LIBRARIES}                     # RCCL 静态/动态库（例如 rccl 或 rccl.lib）
+  )
+else()
+  target_link_libraries(rccl_common PUBLIC roc::rccl hip::device)
+endif()
 if(USE_MPI)
   target_link_libraries(rccl_common MPI::MPI_CXX)
 endif()
