@@ -53,7 +53,9 @@
 #include <cstdio>
 #include <cstdint>
 #include <cmath>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 using std::size_t;
 using std::int8_t;

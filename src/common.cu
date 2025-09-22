@@ -11,17 +11,150 @@
 #include "rccl_float8.h"
 #include <hip/hip_bfloat16.h>
 #include "common.h"
-#include <pthread.h>
 #include <cstdio>
 #include <type_traits>
-#include <getopt.h>
-#include <libgen.h>
+#include <string>
 #include <string.h>
 #include <ctype.h>
 #include "cuda.h"
 #include <vector>
 #include <utility>
-#include <errno.h>     /* program_invocation_short_name */
+#include <chrono>
+#include <cstdlib>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+
+#ifdef _WIN32
+struct option {
+  const char* name;
+  int has_arg;
+  int* flag;
+  int val;
+};
+
+enum {
+  no_argument = 0,
+  required_argument = 1,
+  optional_argument = 2
+};
+
+static char* optarg = nullptr;
+static int optind = 1;
+static int opterr = 1;
+static int optopt = 0;
+
+static int getopt_long(int argc, char* const argv[], const char* optstring,
+                       const struct option* longopts, int* longindex) {
+  static int optpos = 1;
+  optarg = nullptr;
+
+  if (optind >= argc) {
+    return -1;
+  }
+
+  const char* arg = argv[optind];
+  if (strcmp(arg, "--") == 0) {
+    ++optind;
+    return -1;
+  }
+
+  if (arg[0] != '-' || arg[1] == '\0') {
+    return -1;
+  }
+
+  if (arg[1] == '-' && arg[2] != '\0') {
+    const char* name = arg + 2;
+    const char* value = strchr(name, '=');
+    size_t nameLen = value ? static_cast<size_t>(value - name) : strlen(name);
+
+    int matchIndex = -1;
+    const struct option* match = nullptr;
+    if (longopts) {
+      for (int i = 0; longopts[i].name != nullptr; ++i) {
+        if (strncmp(longopts[i].name, name, nameLen) == 0 && strlen(longopts[i].name) == nameLen) {
+          match = &longopts[i];
+          matchIndex = i;
+          break;
+        }
+      }
+    }
+
+    if (!match) {
+      ++optind;
+      if (opterr) fprintf(stderr, "Unknown option '--%.*s'\n", (int)nameLen, name);
+      return '?';
+    }
+
+    if (longindex) *longindex = matchIndex;
+
+    if (match->has_arg == required_argument) {
+      if (value && value[1] != '\0') {
+        optarg = const_cast<char*>(value + 1);
+      } else if (optind + 1 < argc) {
+        optarg = argv[++optind];
+      } else {
+        ++optind;
+        if (opterr) fprintf(stderr, "Option '--%s' requires an argument\n", match->name);
+        return ':';
+      }
+    } else if (match->has_arg == optional_argument) {
+      if (value && value[1] != '\0') {
+        optarg = const_cast<char*>(value + 1);
+      }
+    } else if (value) {
+      if (opterr) fprintf(stderr, "Option '--%s' must not have an argument\n", match->name);
+      ++optind;
+      return '?';
+    }
+
+    ++optind;
+    if (match->flag) {
+      *(match->flag) = match->val;
+      return 0;
+    }
+    return match->val;
+  }
+
+  char opt = arg[optpos];
+  const char* spec = strchr(optstring, opt);
+  if (!spec) {
+    optopt = opt;
+    if (opterr) fprintf(stderr, "Unknown option '-%c'\n", opt);
+    if (arg[++optpos] == '\0') {
+      optpos = 1;
+      ++optind;
+    }
+    return '?';
+  }
+
+  if (spec[1] == ':') {
+    if (arg[optpos + 1] != '\0') {
+      optarg = argv[optind] + optpos + 1;
+      ++optind;
+    } else if (optind + 1 < argc) {
+      optarg = argv[++optind];
+      ++optind;
+    } else {
+      ++optind;
+      optopt = opt;
+      if (opterr) fprintf(stderr, "Option '-%c' requires an argument\n", opt);
+      optpos = 1;
+      return ':';
+    }
+    optpos = 1;
+  } else {
+    if (arg[++optpos] == '\0') {
+      optpos = 1;
+      ++optind;
+    }
+  }
+
+  return opt;
+}
+#else
+#include <getopt.h>
+#endif
 
 //#define DEBUG_PRINT
 
@@ -37,6 +170,32 @@ size_t cache_bytes = 192 * 1024 * 1024; // Use 192MB
 
 // RCCL_FLOAT8 support
 bool rccl_float8_useFnuz = false;
+
+static std::string ExtractProgramName(const char* path) {
+  if (path == nullptr) {
+    return std::string();
+  }
+  const char* fileName = strrchr(path, '/');
+#ifdef _WIN32
+  const char* alt = strrchr(path, '\\');
+  if (alt && (!fileName || alt > fileName)) {
+    fileName = alt;
+  }
+#endif
+  if (fileName) {
+    return std::string(fileName + 1);
+  }
+  return std::string(path);
+}
+
+static std::string& ProgramShortNameStorage() {
+  static std::string storage;
+  return storage;
+}
+
+static const char* GetProgramShortName() {
+  return ProgramShortNameStorage().c_str();
+}
 bool IsArchMatch(char const* arch, char const* target) {
   // helper function to reduce clutter in code elsewhere.  Returns true on match.
   return (strncmp(arch, target, strlen(target)) == 0);
@@ -351,30 +510,28 @@ testResult_t InitData(void* data, const size_t count, size_t offset, ncclDataTyp
 }
 
 void Barrier(struct threadArgs *args) {
-  thread_local int epoch = 0;
-  static pthread_mutex_t lock[2] = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER};
-  static pthread_cond_t cond[2] = {PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER};
-  static int counter[2] = {0, 0};
+  struct BarrierState {
+    std::mutex mutex;
+    std::condition_variable cv;
+    int count = 0;
+    int generation = 0;
+  };
+  static BarrierState state;
 
-  pthread_mutex_lock(&lock[epoch]);
-  if(++counter[epoch] == args->nThreads)
-    pthread_cond_broadcast(&cond[epoch]);
+  std::unique_lock<std::mutex> lock(state.mutex);
+  int generation = state.generation;
 
-  if(args->thread+1 == args->nThreads) {
-    while(counter[epoch] != args->nThreads)
-      pthread_cond_wait(&cond[epoch], &lock[epoch]);
-    #ifdef MPI_SUPPORT
-      MPI_Barrier(MPI_COMM_WORLD);
-    #endif
-    counter[epoch] = 0;
-    pthread_cond_broadcast(&cond[epoch]);
+  if (++state.count == args->nThreads) {
+#ifdef MPI_SUPPORT
+    MPI_Barrier(MPI_COMM_WORLD);
+#endif
+    state.count = 0;
+    state.generation++;
+    lock.unlock();
+    state.cv.notify_all();
+  } else {
+    state.cv.wait(lock, [&] { return state.generation != generation; });
   }
-  else {
-    while(counter[epoch] != 0)
-      pthread_cond_wait(&cond[epoch], &lock[epoch]);
-  }
-  pthread_mutex_unlock(&lock[epoch]);
-  epoch ^= 1;
 }
 
 // Inter-thread/process barrier+allreduce. The quality of the return value
@@ -382,34 +539,45 @@ void Barrier(struct threadArgs *args) {
 // value will actually be the result of process-local broadcast from the local thread=0.
 template<typename T>
 void Allreduce(struct threadArgs* args, T* value, int average) {
-  thread_local int epoch = 0;
-  static pthread_mutex_t lock[2] = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER};
-  static pthread_cond_t cond[2] = {PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER};
-  static T accumulator[2];
-  static int counter[2] = {0, 0};
+  struct AllreduceState {
+    std::mutex mutex;
+    std::condition_variable cv;
+    T accumulator{};
+    int count = 0;
+    int generation = 0;
+  };
+  static AllreduceState state;
 
-  pthread_mutex_lock(&lock[epoch]);
-  if(counter[epoch] == 0) {
-    if(average != 0 || args->thread == 0) accumulator[epoch] = *value;
+  std::unique_lock<std::mutex> lock(state.mutex);
+  int generation = state.generation;
+
+  if (state.count == 0) {
+    if (average != 0 || args->thread == 0) {
+      state.accumulator = *value;
+    }
   } else {
-    switch(average) {
-    case /*r0*/ 0: if(args->thread == 0) accumulator[epoch] = *value; break;
-    case /*avg*/1: accumulator[epoch] += *value; break;
-    case /*min*/2: accumulator[epoch] = std::min<T>(accumulator[epoch], *value); break;
-    case /*max*/3: accumulator[epoch] = std::max<T>(accumulator[epoch], *value); break;
-    case /*sum*/4: accumulator[epoch] += *value; break;
+    switch (average) {
+      case /*r0*/ 0:
+        if (args->thread == 0) state.accumulator = *value;
+        break;
+      case /*avg*/ 1:
+        state.accumulator += *value;
+        break;
+      case /*min*/ 2:
+        state.accumulator = std::min<T>(state.accumulator, *value);
+        break;
+      case /*max*/ 3:
+        state.accumulator = std::max<T>(state.accumulator, *value);
+        break;
+      case /*sum*/ 4:
+        state.accumulator += *value;
+        break;
     }
   }
 
-  if(++counter[epoch] == args->nThreads)
-    pthread_cond_broadcast(&cond[epoch]);
-
-  if(args->thread+1 == args->nThreads) {
-    while(counter[epoch] != args->nThreads)
-      pthread_cond_wait(&cond[epoch], &lock[epoch]);
-
-    #ifdef MPI_SUPPORT
-    if(average != 0) {
+  if (++state.count == args->nThreads) {
+#ifdef MPI_SUPPORT
+    if (average != 0) {
       static_assert(std::is_same<T, long long>::value || std::is_same<T, double>::value, "Allreduce<T> only for T in {long long, double}");
       MPI_Datatype ty = std::is_same<T, long long>::value ? MPI_LONG_LONG :
                         std::is_same<T, double>::value ? MPI_DOUBLE :
@@ -418,22 +586,23 @@ void Allreduce(struct threadArgs* args, T* value, int average) {
                   average == 2 ? MPI_MIN :
                   average == 3 ? MPI_MAX :
                   average == 4 ? MPI_SUM : MPI_Op();
-      MPI_Allreduce(MPI_IN_PLACE, (void*)&accumulator[epoch], 1, ty, op, MPI_COMM_WORLD);
+      MPI_Allreduce(MPI_IN_PLACE, (void*)&state.accumulator, 1, ty, op, MPI_COMM_WORLD);
     }
-    #endif
+#endif
 
-    if(average == 1) accumulator[epoch] /= args->totalProcs*args->nThreads;
-    counter[epoch] = 0;
-    pthread_cond_broadcast(&cond[epoch]);
+    if (average == 1) state.accumulator /= args->totalProcs*args->nThreads;
+    T result = state.accumulator;
+    state.count = 0;
+    state.generation++;
+    lock.unlock();
+    state.cv.notify_all();
+    *value = result;
+  } else {
+    state.cv.wait(lock, [&] { return state.generation != generation; });
+    T result = state.accumulator;
+    lock.unlock();
+    *value = result;
   }
-  else {
-    while(counter[epoch] != 0)
-      pthread_cond_wait(&cond[epoch], &lock[epoch]);
-  }
-  pthread_mutex_unlock(&lock[epoch]);
-
-  *value = accumulator[epoch];
-  epoch ^= 1;
 }
 
 testResult_t CheckData(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place, int64_t *wrongElts) {
@@ -535,7 +704,7 @@ testResult_t testStreamSynchronize(int ngpus, cudaStream_t* streams, ncclComm_t*
    }
 
    // We might want to let other threads (including NCCL threads) use the CPU.
-   if (idle) sched_yield();
+   if (idle) std::this_thread::yield();
   }
   free(done);
   return testSuccess;
@@ -942,7 +1111,7 @@ testResult_t TimeTest(struct threadArgs* args, ncclDataType_t type, const char* 
       PRINT("%12li  %12li  %8s  %6s  %6s", std::max(args->sendBytes, args->expectedBytes), args->nbytes / wordSize(type), typeName, opName, rootName);
       if (enable_out_of_place) {
         TESTCHECK(BenchTime(args, type, op, root, 0));
-        usleep(delay_inout_place);
+        std::this_thread::sleep_for(std::chrono::microseconds(delay_inout_place));
       }
         if (enable_in_place)
         TESTCHECK(BenchTime(args, type, op, root, 1));
@@ -1018,13 +1187,11 @@ testResult_t threadInit(struct threadArgs* args) {
   return testSuccess;
 }
 
-void* threadLauncher(void* thread_) {
-  struct testThread* thread = (struct testThread*)thread_;
-  thread->ret = thread->func(&thread->args);
-  return NULL;
-}
 testResult_t threadLaunch(struct testThread* thread) {
-  pthread_create(&thread->thread, NULL, threadLauncher, thread);
+  thread->worker = std::thread([thread]() {
+    thread->ret = thread->func(&thread->args);
+  });
+  thread->launched = true;
   return testSuccess;
 }
 
@@ -1080,7 +1247,13 @@ testResult_t run(); // Main function
 
 int main(int argc, char* argv[]) {
   // Make sure everyline is flushed so that we see the progress of the test
+#ifdef _WIN32
+  setvbuf(stdout, nullptr, _IOLBF, 0);
+#else
   setlinebuf(stdout);
+#endif
+
+  ProgramShortNameStorage() = ExtractProgramName(argc > 0 ? argv[0] : "rccl-test");
 
   #if NCCL_VERSION_CODE >= NCCL_VERSION(2,4,0)
     ncclGetVersion(&test_ncclVersion);
@@ -1331,7 +1504,7 @@ int main(int argc, char* argv[]) {
             "[-x,--output_file <output file name>] \n\t"
             "[-Z,--output_format <output format <csv|json>] \n\t"
             "[-h,--help]\n",
-          basename(argv[0]));
+          GetProgramShortName());
         return 0;
     }
   }
@@ -1450,7 +1623,7 @@ testResult_t run() {
 #endif
   is_main_thread = is_main_proc = (proc == 0) ? 1 : 0;
 
-  PRINT("# Collective test starting: %s\n", program_invocation_short_name);
+  PRINT("# Collective test starting: %s\n", GetProgramShortName());
   PRINT("# nThread %d nGpus %d minBytes %ld maxBytes %ld step: %ld(%s) warmup iters: %d iters: %d agg iters: %d validation: %d graph: %d\n",
         nThreads, nGpus, minBytes, maxBytes,
         (stepFactor > 1)?stepFactor:stepBytes, (stepFactor > 1)?"factor":"bytes",
@@ -1632,7 +1805,6 @@ testResult_t run() {
   Reporter reporter(output_file, output_format);
 
   std::vector<testThread> threads(nThreads);
-  memset(threads.data(), 0, sizeof(struct testThread)*nThreads);
 
   for (int t=nThreads-1; t>=0; t--) {
     threads[t].args.minbytes=minBytes;
@@ -1674,7 +1846,10 @@ testResult_t run() {
 
   // Wait for other threads and accumulate stats and errors
   for (int t=nThreads-1; t>=0; t--) {
-    if (t) pthread_join(threads[t].thread, NULL);
+    if (threads[t].launched && threads[t].worker.joinable()) {
+      threads[t].worker.join();
+      threads[t].launched = false;
+    }
     TESTCHECK(threads[t].ret);
     if (t) {
       errors[0] += errors[t];
@@ -1732,7 +1907,7 @@ testResult_t run() {
   PRINT("# Out of bounds values : %d %s\n", errors[0], errors[0] ? "FAILED" : "OK");
   PRINT("# Avg bus bandwidth    : %g %s\n", bw[0], check_avg_bw == -1 ? "" : (bw[0] < check_avg_bw*(0.9) ? "FAILED" : "OK"));
   PRINT("#\n");
-  PRINT("# Collective test concluded: %s\n", program_invocation_short_name);
+  PRINT("# Collective test concluded: %s\n", GetProgramShortName());
 #ifdef MPI_SUPPORT
   MPI_Comm_free(&mpi_comm);
   MPI_Finalize();

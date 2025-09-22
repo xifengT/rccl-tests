@@ -21,9 +21,11 @@ function(add_rccl_test TEST)
     # Create a custom command to create hipified source code
     add_custom_command(
         OUTPUT ${HIP_FILE}
-        COMMAND mkdir -p ${HIP_FILE_DIR} && $ ${hipify-perl_executable} -quiet-warnings ${SOURCE_DIR}/${TEST_SOURCE} -o ${HIP_FILE}
-        MAIN_DEPENDENCY ${TEST_SOURCE}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${HIP_FILE_DIR}
+        COMMAND ${hipify-perl_executable} -quiet-warnings ${SOURCE_DIR}/${TEST_SOURCE} -o ${HIP_FILE}
+        DEPENDS ${SOURCE_DIR}/${TEST_SOURCE}
         COMMENT "Hipifying ${TEST_SOURCE} -> ${HIP_FILE}"
+        VERBATIM
     )
 
     set(TEST_TARGET "${TEST}_perf")
@@ -41,11 +43,12 @@ function(add_rccl_test TEST)
     )
     add_relative_test(${TEST} ${TEST_TARGET})
     rocm_install(TARGETS ${TEST_TARGET})
-    # TODO: copy/install DLLs on Windows
-    set_target_properties(
-        ${TEST_TARGET} PROPERTIES
-        INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/lib;${ROCM_PATH}/lib"
-    )
+    if(NOT WIN32)
+        set_target_properties(
+            ${TEST_TARGET} PROPERTIES
+            INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/lib;${ROCM_PATH}/lib"
+        )
+    endif()
 endfunction()
 
 function(add_relative_test test_name test_target)
@@ -82,6 +85,9 @@ set(COMMON_FILES
 # Hipify common files (copy of source generated into hipify directory)
 #==================================================================================================
 find_program(hipify-perl_executable hipify-perl)
+if(NOT hipify-perl_executable)
+  message(FATAL_ERROR "hipify-perl executable not found. Please ensure ROCm HIP tools are installed and available in PATH.")
+endif()
 set(HIPIFY_DIR "${CMAKE_CURRENT_BINARY_DIR}/hipify")
 set(SOURCE_DIR "${CMAKE_SOURCE_DIR}/src")
 
@@ -103,9 +109,11 @@ foreach(COMMON_FILE ${COMMON_FILES})
   # Create a custom command to create hipified source code
   add_custom_command(
     OUTPUT ${HIP_FILE}
-    COMMAND mkdir -p ${HIPIFY_DIR} && $ ${hipify-perl_executable} -quiet-warnings ${SOURCE_DIR}/${COMMON_FILE} -o ${HIP_FILE}
-    MAIN_DEPENDENCY ${COMMON_FILE}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${HIPIFY_DIR}
+    COMMAND ${hipify-perl_executable} -quiet-warnings ${SOURCE_DIR}/${COMMON_FILE} -o ${HIP_FILE}
+    DEPENDS ${SOURCE_DIR}/${COMMON_FILE}
     COMMENT "Hipifying ${COMMON_FILE} -> ${HIP_FILE}"
+    VERBATIM
   )
 endforeach()
 
