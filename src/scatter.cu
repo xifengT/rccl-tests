@@ -5,7 +5,7 @@
  * See LICENSE.txt for license information
  ************************************************************************/
 
-#include "cuda_runtime.h"
+#include <hip/hip_runtime.h>
 #include "common.h"
 
 void ScatterGetCollByteCount(size_t *sendcount, size_t *recvcount, size_t *paramcount, size_t *sendInplaceOffset, size_t *recvInplaceOffset, size_t count, size_t eltSize, int nranks) {
@@ -21,13 +21,13 @@ testResult_t ScatterInitData(struct threadArgs* args, ncclDataType_t type, ncclR
   size_t recvcount = args->expectedBytes / wordSize(type);
 
   for (int i=0; i<args->nGpus; i++) {
-    CUDACHECK(cudaSetDevice(args->gpus[i]));
+    HIPCHECK(hipSetDevice(args->gpus[i]));
     int rank = ((args->proc*args->nThreads + args->thread)*args->nGpus + i);
-    CUDACHECK(cudaMemset(args->recvbuffs[i], 0, args->expectedBytes));
+    HIPCHECK(hipMemset(args->recvbuffs[i], 0, args->expectedBytes));
     void* data = in_place ? args->recvbuffs[i] : args->sendbuffs[i];
     if (rank == root) TESTCHECK(InitData(data, sendcount, 0, type, ncclSum, rep, 1, 0));
     TESTCHECK(InitData(args->expected[i], recvcount, rank*recvcount, type, ncclSum, rep, 1, 0));
-    CUDACHECK(cudaDeviceSynchronize());
+    HIPCHECK(hipDeviceSynchronize());
   }
   return testSuccess;
 }
@@ -40,7 +40,7 @@ void ScatterGetBw(size_t count, int typesize, double sec, double* algBw, double*
   *busBw = baseBw * factor;
 }
 
-testResult_t ScatterRunColl(void* sendbuff, void* recvbuff, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream) {
+testResult_t ScatterRunColl(void* sendbuff, void* recvbuff, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, hipStream_t stream) {
   int nRanks;
   NCCLCHECK(ncclCommCount(comm, &nRanks));
   int rank;

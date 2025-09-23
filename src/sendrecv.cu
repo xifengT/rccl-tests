@@ -5,7 +5,7 @@
  * See LICENSE.txt for license information
  ************************************************************************/
 
-#include "cuda_runtime.h"
+#include <hip/hip_runtime.h>
 #include "common.h"
 
 void SendRecvGetCollByteCount(size_t *sendcount, size_t *recvcount, size_t *paramcount, size_t *sendInplaceOffset, size_t *recvInplaceOffset, size_t count, size_t eltSize, int nranks) {
@@ -22,14 +22,14 @@ testResult_t SendRecvInitData(struct threadArgs* args, ncclDataType_t type, nccl
   int nranks = args->nProcs*args->nThreads*args->nGpus;
 
   for (int i=0; i<args->nGpus; i++) {
-    CUDACHECK(cudaSetDevice(args->gpus[i]));
+    HIPCHECK(hipSetDevice(args->gpus[i]));
     int rank = ((args->proc*args->nThreads + args->thread)*args->nGpus + i);
-    CUDACHECK(cudaMemset(args->recvbuffs[i], 0, args->expectedBytes));
+    HIPCHECK(hipMemset(args->recvbuffs[i], 0, args->expectedBytes));
     void* data = in_place ? args->recvbuffs[i] : args->sendbuffs[i];
     TESTCHECK(InitData(data, sendcount, rank*sendcount, type, ncclSum, rep, 1, 0));
     int peer = (rank-1+nranks)%nranks;
     TESTCHECK(InitData(args->expected[i], recvcount, peer*recvcount, type, ncclSum, rep, 1, 0));
-    CUDACHECK(cudaDeviceSynchronize());
+    HIPCHECK(hipDeviceSynchronize());
   }
   // We don't support in-place sendrecv
   args->reportErrors = in_place ? 0 : 1;
@@ -44,7 +44,7 @@ void SendRecvGetBw(size_t count, int typesize, double sec, double* algBw, double
   *busBw = baseBw * factor;
 }
 
-testResult_t SendRecvRunColl(void* sendbuff, void* recvbuff, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream) {
+testResult_t SendRecvRunColl(void* sendbuff, void* recvbuff, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, hipStream_t stream) {
   int nRanks;
   NCCLCHECK(ncclCommCount(comm, &nRanks));
   int rank;

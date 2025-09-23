@@ -6,7 +6,7 @@ cmake_minimum_required(VERSION 3.16 FATAL_ERROR)
 
 # CMake Toolchain file to define compilers and path to ROCm
 #==================================================================================================
-if (NOT CMAKE_TOOLCHAIN_FILE)
+if (NOT CMAKE_TOOLCHAIN_FILE AND NOT WIN32)
   set(CMAKE_TOOLCHAIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/toolchain-linux.cmake")
   message(STATUS "CMAKE_TOOLCHAIN_FILE: ${CMAKE_TOOLCHAIN_FILE}")
 endif()
@@ -88,18 +88,12 @@ set(ENV{ROCM_PATH} ${ROCM_PATH})
 if("${CMAKE_CXX_COMPILER}" MATCHES ".*amdclang\\+\\+")
   message(STATUS "Compiling with amdclang++")
   set(COMPILER_EXE_NAME amdclang++)
-  set(COMPILER_GREP_STRING "AMD clang version")
-  set(COMPILER_AWK_CMD "awk -F\" \" '{ printf $4}'")
 elseif("${CMAKE_CXX_COMPILER}" MATCHES ".*clang\\+\\+")
   message(STATUS "Compiling with clang++")
   set(COMPILER_EXE_NAME clang++)
-  set(COMPILER_GREP_STRING "AMD clang version")
-  set(COMPILER_AWK_CMD "awk -F\" \" '{ printf $4}'")
 elseif("${CMAKE_CXX_COMPILER}" MATCHES ".*hipcc$")
   message(STATUS "Compiling with hipcc")
   set(COMPILER_EXE_NAME hipcc)
-  set(COMPILER_GREP_STRING "HIP version")
-  set(COMPILER_AWK_CMD "awk -F\" \" '{ printf $3}' | awk -F\"-\" '{ printf $1}'")
 else()
   message(FATAL_ERROR "RCCL-Tests can be built only with hipcc or amdclang++")
 endif()
@@ -121,7 +115,9 @@ endif()
 # Check for required dependencies
 #==================================================================================================
 ## Check for Threads
-set(THREADS_PREFER_PTHREAD_FLAG ON)
+if (NOT WIN32)
+  set(THREADS_PREFER_PTHREAD_FLAG ON)
+endif()
 find_package(Threads REQUIRED)
 
 ## Check for HIP
@@ -136,25 +132,61 @@ endif()
 find_program(compiler_executable ${COMPILER_EXE_NAME})
 message(STATUS "${COMPILER_EXE_NAME} executable: ${compiler_executable}")
 execute_process(
-  COMMAND         bash "-c" "${compiler_executable} --version | grep \"${COMPILER_GREP_STRING}\" | ${COMPILER_AWK_CMD}"
-  OUTPUT_VARIABLE compiler_version_string)
-message(STATUS "${COMPILER_EXE_NAME} version:    ${compiler_version_string}")
+  COMMAND ${compiler_executable} --version
+  OUTPUT_VARIABLE compiler_version_output
+  RESULT_VARIABLE compiler_version_status
+  OUTPUT_STRIP_TRAILING_WHITESPACE)
+if(compiler_version_status EQUAL 0)
+  string(REGEX MATCH "([0-9]+\\.[0-9]+\\.[0-9]+)" compiler_version_match "${compiler_version_output}")
+  if(compiler_version_match)
+    set(compiler_version_string "${CMAKE_MATCH_1}")
+  else()
+    string(REGEX MATCH "^.*" compiler_version_line "${compiler_version_output}")
+    set(compiler_version_string "${compiler_version_line}")
+  endif()
+  message(STATUS "${COMPILER_EXE_NAME} version:    ${compiler_version_string}")
+else()
+  message(WARNING "Unable to determine ${COMPILER_EXE_NAME} version")
+endif()
 
 ## Check for HIP version
 find_program(hipconfig_executable hipconfig)
 message(STATUS "hipconfig executable: ${hipconfig_executable}")
-execute_process(
-  COMMAND         bash "-c" "${hipconfig_executable} -v | awk -F\"-\" '{ printf $1 }'"
-  OUTPUT_VARIABLE hip_version_string)
-message(STATUS "${COMPILER_EXE_NAME} HIP version:    ${hip_version_string}")
+if(hipconfig_executable)
+  execute_process(
+    COMMAND ${hipconfig_executable} -v
+    OUTPUT_VARIABLE hip_version_output
+    RESULT_VARIABLE hip_version_status
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+  if(hip_version_status EQUAL 0)
+    string(REGEX MATCH "([0-9]+\\.[0-9]+\\.[0-9]+)" hip_version_match "${hip_version_output}")
+    if(hip_version_match)
+      set(hip_version_string "${CMAKE_MATCH_1}")
+    else()
+      string(REGEX MATCH "^.*" hip_version_line "${hip_version_output}")
+      set(hip_version_string "${hip_version_line}")
+    endif()
+    message(STATUS "${COMPILER_EXE_NAME} HIP version:    ${hip_version_string}")
+  else()
+    message(WARNING "Unable to determine HIP version using hipconfig")
+  endif()
+else()
+  message(WARNING "hipconfig executable not found")
+endif()
 
 ##Check for ROCm version
 set(EXPLICIT_ROCM_VERSION "" CACHE STRING "Explicit ROCM version to compile to (auto detect if empty)")
 if(EXPLICIT_ROCM_VERSION)
   set(rocm_version_string "${EXPLICIT_ROCM_VERSION}")
 elseif(ROCM_PATH)
-  message(STATUS "Reading ROCM version from ${ROCM_PATH}/.info/version")
-  file(READ "${ROCM_PATH}/.info/version" rocm_version_string)
+  set(_rocm_info_file "${ROCM_PATH}/.info/version")
+  if(EXISTS "${_rocm_info_file}")
+    message(STATUS "Reading ROCM version from ${_rocm_info_file}")
+    file(READ "${_rocm_info_file}" rocm_version_string)
+  else()
+    message(WARNING "Could not find ${_rocm_info_file}; ROCm version detection skipped")
+    set(rocm_version_string "")
+  endif()
 else()
   message(FATAL_ERROR "Could not determine ROCM version (set EXPLICIT_ROCM_VERSION or set ROCM_PATH to a valid installation)")
 endif()
@@ -174,11 +206,19 @@ else()
 endif()
 
 ## Check for RCCL
-find_package(RCCL CONFIG REQUIRED HINTS "${CMAKE_PREFIX_PATH}" PATHS "${ROCM_PATH}")
-if (RCCL_FOUND)
-    message(STATUS "RCCL version : ${RCCL_VERSION}")
-    message(STATUS "RCCL include path : ${RCCL_INCLUDE_DIRS}")
-    message(STATUS "RCCL libraries : ${RCCL_LIBRARIES}")
+if (WIN32)
+  # Windows 平台暂时没有官方的 RCCL Config 包，因此这里提供可配置的占位路径，方便手动指定。
+  set(RCCL_WINDOWS_INCLUDE_DIR "D:/xudong/rccl/include" CACHE PATH "RCCL 头文件所在目录（示例值，请根据本地环境修改）")
+  set(RCCL_WINDOWS_LIBRARY_DIR "D:/xudong/rccl/lib" CACHE PATH "RCCL 库文件所在目录（示例值，请根据本地环境修改）")
+  set(RCCL_LIBRARIES       "rccl" CACHE STRING "需要链接的 RCCL 库名称或完整路径（例如 rccl 或 rccl.lib，可按需调整）")
+  set(RCCL_INCLUDE_DIRS    "${RCCL_WINDOWS_INCLUDE_DIR}")
+else()
+  find_package(RCCL CONFIG REQUIRED HINTS "${CMAKE_PREFIX_PATH}" PATHS "${ROCM_PATH}")
+  if (RCCL_FOUND)
+      message(STATUS "RCCL version : ${RCCL_VERSION}")
+      message(STATUS "RCCL include path : ${RCCL_INCLUDE_DIRS}")
+      message(STATUS "RCCL libraries : ${RCCL_LIBRARIES}")
+  endif()
 endif()
 
 ## Check for MPI (if enabled)

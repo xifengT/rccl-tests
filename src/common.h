@@ -9,6 +9,7 @@
 #define __COMMON_H__
 
 #include "rccl/rccl.h"
+#include <hip/hip_runtime.h>
 #include <stdio.h>
 #include <cstdint>
 #include <cstring>
@@ -16,7 +17,7 @@
 #ifdef MPI_SUPPORT
 #include "mpi.h"
 #endif
-#include <pthread.h>
+#include <thread>
 #include "nccl1_compat.h"
 #include "timer.h"
 #include <string>
@@ -24,6 +25,8 @@
 #include <iostream>
 #include <utility>
 #include <vector>
+#include <condition_variable>
+#include <mutex>
 
 // Ensures backward compatibility for FP8 datatypes
 #if NCCL_VERSION_CODE < NCCL_VERSION(2,24,3)
@@ -34,16 +37,16 @@
 // For nccl.h < 2.13 since we define a weak fallback
 extern "C" char const* ncclGetLastError(ncclComm_t comm);
 
-#define CUDACHECK(cmd) do {                         \
-  cudaError_t err = cmd;                            \
-  if( err != cudaSuccess ) {                        \
-    char hostname[1024];                            \
-    getHostName(hostname, 1024);                    \
-    printf("%s: Test CUDA failure %s:%d '%s'\n",    \
-         hostname,                                  \
-        __FILE__,__LINE__,cudaGetErrorString(err)); \
-    return testCudaError;                           \
-  }                                                 \
+#define HIPCHECK(cmd) do {                          \
+  hipError_t err = cmd;                            \
+  if( err != hipSuccess ) {                        \
+    char hostname[1024];                           \
+    getHostName(hostname, 1024);                   \
+    printf("%s: Test HIP failure %s:%d '%s'\n",    \
+         hostname,                                 \
+        __FILE__,__LINE__,hipGetErrorString(err)); \
+    return testHipError;                           \
+  }                                                \
 } while(0)
 
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,13,0)
@@ -77,7 +80,7 @@ extern "C" char const* ncclGetLastError(ncclComm_t comm);
 typedef enum {
   testSuccess = 0,
   testInternalError = 1,
-  testCudaError = 2,
+  testHipError = 2,
   testNcclError = 3,
   testTimeout = 4,
   testNumResults = 5
@@ -106,7 +109,7 @@ struct testColl {
       ncclRedOp_t op, int root, int rep, int in_place);
   void (*getBw)(size_t count, int typesize, double sec, double* algBw, double* busBw, int nranks);
   testResult_t (*runColl)(void* sendbuff, void* recvbuff, size_t count, ncclDataType_t type,
-      ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream);
+      ncclRedOp_t op, int root, ncclComm_t comm, hipStream_t stream);
 };
 extern struct testColl allReduceTest;
 extern struct testColl allGatherTest;
@@ -172,7 +175,7 @@ struct threadArgs {
   size_t recvInplaceOffset;
   ncclUniqueId ncclId;
   ncclComm_t* comms;
-  cudaStream_t* streams;
+  hipStream_t* streams;
 
   void** expected;
   size_t expectedBytes;
@@ -189,10 +192,11 @@ struct threadArgs {
 
 typedef testResult_t (*threadFunc_t)(struct threadArgs* args);
 struct testThread {
-  pthread_t thread;
-  threadFunc_t func;
-  struct threadArgs args;
-  testResult_t ret;
+  std::thread worker;
+  threadFunc_t func = nullptr;
+  struct threadArgs args{};
+  testResult_t ret = testSuccess;
+  bool launched = false;
 };
 
 // Provided by common.cu
@@ -202,10 +206,29 @@ extern testResult_t InitDataReduce(void* data, const size_t count, const size_t 
 extern testResult_t InitData(void* data, const size_t count, size_t offset, ncclDataType_t type, ncclRedOp_t op, const uint64_t seed, const int nranks, const int rank);
 extern void AllocateBuffs(void **sendbuff, void **recvbuff, void **expected, void **expectedHost, size_t nbytes, int nranks);
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <process.h>
+#define getpid _getpid
+#else
 #include <unistd.h>
+#endif
 
 static void getHostName(char* hostname, int maxlen) {
+#ifdef _WIN32
+  DWORD size = static_cast<DWORD>(maxlen);
+  if (!GetComputerNameA(hostname, &size)) {
+    if (maxlen > 0) {
+      hostname[0] = '\0';
+    }
+    return;
+  }
+#else
   gethostname(hostname, maxlen);
+#endif
   for (int i=0; i< maxlen; i++) {
     if (hostname[i] == '.') {
       hostname[i] = '\0';
@@ -240,17 +263,35 @@ static uint64_t getHostHash(const char* hostname) {
   (void) strncpy(hostHash, hostname, sizeof(hostHash));
   int offset = strlen(hostHash);
 
+  bool hashExtended = false;
+#ifdef _WIN32
+  char systemPath[MAX_PATH] = {0};
+  UINT sysLen = GetWindowsDirectoryA(systemPath, MAX_PATH);
+  char rootPath[4] = "C:\\";
+  if (sysLen >= 3 && systemPath[1] == ':' && (systemPath[2] == '\\' || systemPath[2] == '/')) {
+    rootPath[0] = systemPath[0];
+  }
+
+  DWORD serialNumber = 0;
+  if (GetVolumeInformationA(rootPath, nullptr, 0, &serialNumber, nullptr, nullptr, nullptr, 0)) {
+    int written = snprintf(hostHash + offset, sizeof(hostHash) - offset, "%lu", static_cast<unsigned long>(serialNumber));
+    if (written > 0) {
+      hashExtended = true;
+    }
+  }
+#else
   FILE *file = fopen(HOSTID_FILE, "r");
   if (file != NULL) {
     char *p;
     if (fscanf(file, "%ms", &p) == 1) {
         strncpy(hostHash+offset, p, sizeof(hostHash)-offset-1);
         free(p);
+        hashExtended = true;
     }
+    fclose(file);
   }
-  fclose(file);
+#endif
 
-  // Make sure the string is terminated
   hostHash[sizeof(hostHash)-1]='\0';
 
   return getHash(hostHash, strlen(hostHash));

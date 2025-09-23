@@ -21,9 +21,11 @@ function(add_rccl_test TEST)
     # Create a custom command to create hipified source code
     add_custom_command(
         OUTPUT ${HIP_FILE}
-        COMMAND mkdir -p ${HIP_FILE_DIR} && $ ${hipify-perl_executable} -quiet-warnings ${SOURCE_DIR}/${TEST_SOURCE} -o ${HIP_FILE}
-        MAIN_DEPENDENCY ${TEST_SOURCE}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${HIP_FILE_DIR}
+        COMMAND ${hipify-perl_executable} -quiet-warnings ${SOURCE_DIR}/${TEST_SOURCE} -o ${HIP_FILE}
+        DEPENDS ${SOURCE_DIR}/${TEST_SOURCE}
         COMMENT "Hipifying ${TEST_SOURCE} -> ${HIP_FILE}"
+        VERBATIM
     )
 
     set(TEST_TARGET "${TEST}_perf")
@@ -41,11 +43,12 @@ function(add_rccl_test TEST)
     )
     add_relative_test(${TEST} ${TEST_TARGET})
     rocm_install(TARGETS ${TEST_TARGET})
-    # TODO: copy/install DLLs on Windows
-    set_target_properties(
-        ${TEST_TARGET} PROPERTIES
-        INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/lib;${ROCM_PATH}/lib"
-    )
+    if(NOT WIN32)
+        set_target_properties(
+            ${TEST_TARGET} PROPERTIES
+            INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/lib;${ROCM_PATH}/lib"
+        )
+    endif()
 endfunction()
 
 function(add_relative_test test_name test_target)
@@ -82,6 +85,9 @@ set(COMMON_FILES
 # Hipify common files (copy of source generated into hipify directory)
 #==================================================================================================
 find_program(hipify-perl_executable hipify-perl)
+if(NOT hipify-perl_executable)
+  message(FATAL_ERROR "hipify-perl executable not found. Please ensure ROCm HIP tools are installed and available in PATH.")
+endif()
 set(HIPIFY_DIR "${CMAKE_CURRENT_BINARY_DIR}/hipify")
 set(SOURCE_DIR "${CMAKE_SOURCE_DIR}/src")
 
@@ -103,9 +109,11 @@ foreach(COMMON_FILE ${COMMON_FILES})
   # Create a custom command to create hipified source code
   add_custom_command(
     OUTPUT ${HIP_FILE}
-    COMMAND mkdir -p ${HIPIFY_DIR} && $ ${hipify-perl_executable} -quiet-warnings ${SOURCE_DIR}/${COMMON_FILE} -o ${HIP_FILE}
-    MAIN_DEPENDENCY ${COMMON_FILE}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${HIPIFY_DIR}
+    COMMAND ${hipify-perl_executable} -quiet-warnings ${SOURCE_DIR}/${COMMON_FILE} -o ${HIP_FILE}
+    DEPENDS ${SOURCE_DIR}/${COMMON_FILE}
     COMMENT "Hipifying ${COMMON_FILE} -> ${HIP_FILE}"
+    VERBATIM
   )
 endforeach()
 
@@ -126,7 +134,53 @@ add_custom_target(git_version_check
 add_custom_target(hipify DEPENDS ${HIP_COMMON_SOURCES})
 add_library(rccl_common OBJECT ${HIP_COMMON_SOURCES})
 add_dependencies(rccl_common hipify git_version_check)
-target_link_libraries(rccl_common roc::rccl hip::device Threads::Threads)
+target_link_libraries(rccl_common PUBLIC Threads::Threads)
+
+if (WIN32)
+  # ====== Windows 平台: 根据本地环境配置 HIP/RCCL 的头文件与库路径 ======
+  set(LLVM_PREBUILD_PATH "D:/xudong/HIP/llvm-lst-install" CACHE PATH "HIP LLVM 预编译路径（示例值，可按需修改）")
+  set(DEVLIB_PREBUILD_PATH "D:/xudong/HIP/devlib-lst-install" CACHE PATH "ROCm 设备库路径（示例值，可按需修改）")
+  set(HIP_PREBUILD_PATH   "D:/xudong/HIP/hip-install"       CACHE PATH "HIP SDK 根目录（示例值，可按需修改）")
+  set(HIP_WINDOWS_OFFLOAD_ARCH "g100" CACHE STRING "需要启用的 GPU 架构（示例值，可替换为本机实际架构）")
+
+  target_include_directories(rccl_common
+    PUBLIC
+      "${HIP_PREBUILD_PATH}/include"        # HIP 头文件目录
+      "${RCCL_INCLUDE_DIRS}"               # RCCL 头文件目录（需按实际情况调整）
+  )
+  target_link_directories(rccl_common
+    PUBLIC
+      "${HIP_PREBUILD_PATH}/lib"           # HIP 库目录
+      "${RCCL_WINDOWS_LIBRARY_DIR}"        # RCCL 库目录（示例路径，可修改）
+  )
+  target_compile_options(rccl_common
+    PUBLIC
+      -v                                    # 对应批处理里的 -v
+      -g                                    # 生成调试信息，便于排查问题
+      -O2                                   # 与批处理保持一致的优化等级
+      --offload-arch=${HIP_WINDOWS_OFFLOAD_ARCH}      # 设备架构（示例：g100）
+      -DHIP_PLATFORM=amd                    # AMD 平台编译宏
+      -x hip                                # 明确使用 HIP 前端
+      --rocm-path=${LLVM_PREBUILD_PATH}/lib # HIP 编译阶段需要的 ROCm 路径
+      --rocm-device-lib-path=${DEVLIB_PREBUILD_PATH}/amdgcn/bitcode # 设备 bitcode 路径
+  )
+  target_link_options(rccl_common
+    PUBLIC
+      -v
+      --offload-arch=${HIP_WINDOWS_OFFLOAD_ARCH}
+      --rocm-path=${LLVM_PREBUILD_PATH}/lib
+      --rocm-device-lib-path=${DEVLIB_PREBUILD_PATH}/amdgcn/bitcode
+  )
+  target_link_libraries(rccl_common
+    PUBLIC
+      hip::device                           # HIP CMake 目标，包含通用依赖
+      amdhip64                              # HIP 运行时（示例值，可根据需要调整）
+      hiprtc                                # HIP RTC 库（示例值，可根据需要调整）
+      ${RCCL_LIBRARIES}                     # RCCL 静态/动态库（例如 rccl 或 rccl.lib）
+  )
+else()
+  target_link_libraries(rccl_common PUBLIC roc::rccl hip::device)
+endif()
 if(USE_MPI)
   target_link_libraries(rccl_common MPI::MPI_CXX)
 endif()
